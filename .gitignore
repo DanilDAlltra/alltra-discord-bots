@@ -1,0 +1,14 @@
+# Don't upload node modules
+node_modules/
+
+# Don't upload environment files (secret tokens)
+.env
+price-bot/.env
+analytics-bot/.env
+
+# Logs & cache
+npm-debug.log
+.DS_Store
+
+# Ignore pm2 logs
+pm2.log
