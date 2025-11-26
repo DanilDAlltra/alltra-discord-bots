@@ -23,6 +23,10 @@ const TOKEN_EMOJIS = {
   CHT: "<:cht:1442314225455333467>",
 };
 
+// 🔹 Fiat disclaimer (Option 4)
+const FIAT_DISCLAIMER =
+  "💡 AUD / USD prices use the internal Alltraverse blockchain rate and may differ from future external market rates.";
+
 // Map command names to actual token symbols in the API
 const PRICE_COMMAND_MAP = {
   priceall: "ALL",
@@ -208,6 +212,8 @@ client.on("interactionCreate", async (interaction) => {
         `• Token price: **$${prices.usd.toFixed(6)} USD** | **$${prices.aud.toFixed(6)} AUD**`,
         `• Amount: **${amount} ${symbol}**`,
         `• Total: **$${totalUsd.toFixed(6)} USD** | **$${totalAud.toFixed(6)} AUD**`,
+        "",
+        FIAT_DISCLAIMER,
       ].join("\n")
     );
   }
@@ -232,6 +238,8 @@ client.on("interactionCreate", async (interaction) => {
       `${emoji} **${symbol}** price:`,
       `• **$${usdStr} USD**`,
       `• **$${audStr} AUD**`,
+      "",
+      FIAT_DISCLAIMER,
     ].join("\n")
   );
 });
