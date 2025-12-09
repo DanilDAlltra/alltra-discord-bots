@@ -58,29 +58,129 @@ function makeVoiceKey(guildId, userId) {
   return `${guildId}-${userId}`
 }
 
+// Track invite usage so we can see which code was used on join
+// guildInvites: key = guildId, value = Map(inviteCode -> uses)
+const guildInvites = new Map()
+
+// Track last message per user to detect spammy behaviour
+// key = userId, value = { lastMessageAt: number (ms), lastMessageContent: string }
+const userMessageState = new Map()
+
 // Prefix for basic mod commands like !warn
 const MOD_COMMAND_PREFIX = '!'
 
 // ----- Bot ready -----
-client.once(Events.ClientReady, (c) => {
+client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`)
+
+  // Preload invite usage for referral tracking
+  for (const [guildId, guild] of c.guilds.cache) {
+    if (!isTrackedGuild(guild)) continue
+    try {
+      const invites = await guild.invites.fetch()
+      const codeUsesMap = new Map()
+      invites.forEach((inv) => {
+        codeUsesMap.set(inv.code, inv.uses ?? 0)
+      })
+      guildInvites.set(guild.id, codeUsesMap)
+      console.log(`📨 Loaded ${invites.size} invites for guild ${guild.name}`)
+    } catch (err) {
+      console.error(`Error fetching invites for guild ${guild.name}:`, err)
+    }
+  }
 })
 
 // 🧱 A. CORE USER ACTIVITY
 
-// 1) User joined
-client.on(Events.GuildMemberAdd, (member) => {
+// 1) User joined + referral detection
+client.on(Events.GuildMemberAdd, async (member) => {
   if (!isTrackedGuild(member.guild)) return
 
   const user = member.user
+
+  // A) Basic "user joined" event
   trackDiscordEvent('discord_user_joined', user.id, {
     user_id: user.id,
     username: `${user.username}#${user.discriminator}`,
     joined_at: member.joinedAt?.toISOString() || new Date().toISOString()
-    // invite_code: null // you can implement invite tracking later
   })
 
   console.log(`👋 User joined: ${user.tag}`)
+
+  // B) Referral detection via invite usage diff
+  try {
+    const guild = member.guild
+    const previousInvites = guildInvites.get(guild.id) || new Map()
+    const newInvites = await guild.invites.fetch()
+
+    let usedInvite = null
+
+    newInvites.forEach((inv) => {
+      const oldUses = previousInvites.get(inv.code) ?? 0
+      const newUses = inv.uses ?? 0
+      if (newUses > oldUses) {
+        usedInvite = inv
+      }
+    })
+
+    // Update cache with latest counts
+    const updatedMap = new Map()
+    newInvites.forEach((inv) => {
+      updatedMap.set(inv.code, inv.uses ?? 0)
+    })
+    guildInvites.set(guild.id, updatedMap)
+
+    if (usedInvite && usedInvite.inviter) {
+      const inviter = usedInvite.inviter
+
+      trackDiscordEvent('discord_referral_join', inviter.id, {
+        inviter_id: inviter.id,
+        inviter_username: `${inviter.username}#${inviter.discriminator}`,
+        invited_user_id: user.id,
+        invited_username: `${user.username}#${user.discriminator}`,
+        invite_code: usedInvite.code,
+        guild_id: guild.id,
+        guild_name: guild.name,
+        uses_after_join: usedInvite.uses ?? null
+      })
+
+      console.log(
+        `🤝 Referral: ${user.tag} joined via invite ${usedInvite.code} from ${inviter.tag}`
+      )
+    } else {
+      console.log(
+        `🤝 Referral: ${user.tag} joined but no invite diff was detected`
+      )
+    }
+  } catch (err) {
+    console.error('Error handling referral on member join:', err)
+  }
+})
+
+// 1b) Invite created (keep cache in sync + track)
+client.on(Events.InviteCreate, (invite) => {
+  const guild = invite.guild
+  if (!guild || !isTrackedGuild(guild)) return
+
+  const existing = guildInvites.get(guild.id) || new Map()
+  existing.set(invite.code, invite.uses ?? 0)
+  guildInvites.set(guild.id, existing)
+
+  if (invite.inviter) {
+    trackDiscordEvent('discord_referral_invite_created', invite.inviter.id, {
+      invite_code: invite.code,
+      inviter_id: invite.inviter.id,
+      inviter_username: `${invite.inviter.username}#${invite.inviter.discriminator}`,
+      guild_id: guild.id,
+      guild_name: guild.name,
+      max_uses: invite.maxUses ?? null,
+      temporary: invite.temporary ?? false
+    })
+  }
+
+  console.log(
+    `🔗 Invite created in ${guild.name}: https://discord.gg/${invite.code} (by ${invite.inviter?.tag || 'unknown'})`
+  )
 })
 
 // 2) User left
@@ -97,7 +197,7 @@ client.on(Events.GuildMemberRemove, (member) => {
   console.log(`👋 User left: ${user.tag}`)
 })
 
-// 3) Message sent (core)
+// 3) Message sent (core + scored engagement)
 client.on(Events.MessageCreate, async (message) => {
   // Ignore bot messages (including this bot)
   if (message.author.bot) return
@@ -108,20 +208,63 @@ client.on(Events.MessageCreate, async (message) => {
     message.content.startsWith('/') ||
     message.content.startsWith(MOD_COMMAND_PREFIX)
 
+  // ---------- Anti-spam heuristics ----------
+  const now = Date.now()
+  const trimmedContent = message.content.trim()
+  const trimmedLength = trimmedContent.length
+
+  const lastState = userMessageState.get(message.author.id)
+  const timeSinceLastMessageSec = lastState
+    ? (now - lastState.lastMessageAt) / 1000
+    : null
+
+  const isDuplicateMessage =
+    lastState && lastState.lastMessageContent === trimmedContent
+
+  const isShortMessage = trimmedLength < 10 // e.g. "gm", emoji only, etc.
+
+  // update state
+  userMessageState.set(message.author.id, {
+    lastMessageAt: now,
+    lastMessageContent: trimmedContent
+  })
+
+  // treat as low-value / spammy if any of these are true
+  const looksSpammy =
+    isCommand ||
+    isShortMessage ||
+    isDuplicateMessage ||
+    (timeSinceLastMessageSec !== null && timeSinceLastMessageSec < 10)
+
   const baseProperties = {
     user_id: message.author.id,
     username: `${message.author.username}#${message.author.discriminator}`,
     channel_id: message.channel.id,
     channel_name: message.channel.name,
     message_id: message.id,
-    message_length: message.content.length,
-    is_command: isCommand
+    message_length: trimmedLength,
+    is_command: isCommand,
+
+    // new metadata for scoring
+    time_since_last_message_sec: timeSinceLastMessageSec,
+    is_duplicate_message: isDuplicateMessage,
+    is_short_message: isShortMessage,
+    looks_spammy
   }
 
-  // A) Core activity: any message
+  // A) Core activity: ANY message (for general analytics)
   trackDiscordEvent('discord_message_sent', message.author.id, baseProperties)
 
-  // B) Engagement with announcements
+  // B) Engagement-scored activity: only non-spammy, non-command messages
+  if (!looksSpammy) {
+    trackDiscordEvent('discord_message_scored', message.author.id, {
+      ...baseProperties,
+      is_scored: true,
+      score_value: 1 // you can weight this in PostHog formulas
+    })
+  }
+
+  // C) Engagement with announcements (still logged separately)
   if (message.channel.name === 'announcements') {
     trackDiscordEvent(
       'discord_message_in_announcements',
@@ -130,7 +273,7 @@ client.on(Events.MessageCreate, async (message) => {
     )
   }
 
-  // E) Mod / safety – basic "!warn" command to log warnings
+  // D) Mod / safety – basic "!warn" command to log warnings
   if (
     message.content.startsWith(`${MOD_COMMAND_PREFIX}warn`) &&
     message.member?.permissions.has('ModerateMembers')
@@ -204,8 +347,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 // 🛡️ E. MOD / SAFETY SIGNALS
 
 // 1) Message deleted (we treat as "deleted_by_mod" proxy)
-// Note: Discord does NOT tell us WHO deleted the message in this event.
-// This will log all non-bot message deletions.
 client.on(Events.MessageDelete, async (message) => {
   if (!message.guild) return
   if (!isTrackedGuild(message.guild)) return
@@ -224,7 +365,6 @@ client.on(Events.MessageDelete, async (message) => {
       channel_id: message.channel.id,
       channel_name: message.channel.name,
       message_id: message.id,
-      // We can't reliably know who deleted it – could be user or mod.
       deleted_at: new Date().toISOString()
     }
   )
@@ -246,7 +386,6 @@ client.on(Events.GuildBanAdd, (ban) => {
     username: `${user.username}#${user.discriminator}`,
     guild_id: guild.id,
     guild_name: guild.name,
-    // reason is only available via audit logs; could be added later
     banned_at: new Date().toISOString()
   })
 
