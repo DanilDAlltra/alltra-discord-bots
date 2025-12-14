@@ -7,7 +7,8 @@ const {
   DISCORD_TOKEN,
   POSTHOG_API_KEY,
   POSTHOG_HOST,
-  GUILD_ID
+  GUILD_ID,
+  LEADERBOARD_CHANNEL_ID // 👈 new: channel where the leaderboard message lives
 } = process.env
 
 if (!DISCORD_TOKEN) {
@@ -66,15 +67,79 @@ const guildInvites = new Map()
 // key = userId, value = { lastMessageAt: number (ms), lastMessageContent: string }
 const userMessageState = new Map()
 
+// In-memory engagement + referral scores for Discord leaderboard
+// engagementScores: key = userId, value = { score, username }
+const engagementScores = new Map()
+// referralScores: key = userId, value = { count, username }
+const referralScores = new Map()
+
+// Leaderboard message reference
+let leaderboardMessage = null
+
 // Prefix for basic mod commands like !warn
 const MOD_COMMAND_PREFIX = '!'
+
+// ----- Helper: Build leaderboard text -----
+function buildLeaderboardText() {
+  let text = ''
+  text += '🏆 **Alltraverse Weekly Leaderboards**\n'
+  text +=
+    '_(Live community view. Official winners are confirmed using PostHog analytics each week.)_\n\n'
+
+  // Engagement leaderboard
+  text += '🔥 **Engagement (non-spammy messages)**\n'
+  const engagementTop = [...engagementScores.entries()]
+    .sort((a, b) => b[1].score - a[1].score)
+    .slice(0, 10)
+
+  if (engagementTop.length === 0) {
+    text += '_No engagement data yet._\n'
+  } else {
+    engagementTop.forEach(([userId, data], index) => {
+      text += `${index + 1}. <@${userId}> — **${data.score} pts**\n`
+    })
+  }
+
+  text += '\n'
+
+  // Referral leaderboard
+  text += '🔗 **Referrals (members invited)**\n'
+  const referralTop = [...referralScores.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 10)
+
+  if (referralTop.length === 0) {
+    text += '_No referral data yet._\n'
+  } else {
+    referralTop.forEach(([userId, data], index) => {
+      text += `${index + 1}. <@${userId}> — **${data.count} joins**\n`
+    })
+  }
+
+  text += '\n'
+  text +=
+    '🏅 Each week, the top **Engagement Champion** and **Referral Champion** are eligible for **$50 AUD in ALL Coin**.\n'
+
+  return text
+}
+
+// ----- Helper: Update leaderboard message -----
+async function updateLeaderboardMessage() {
+  if (!leaderboardMessage) return
+  const content = buildLeaderboardText()
+  try {
+    await leaderboardMessage.edit(content)
+  } catch (err) {
+    console.error('Error updating leaderboard message:', err)
+  }
+}
 
 // ----- Bot ready -----
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`)
 
   // Preload invite usage for referral tracking
-  for (const [guildId, guild] of c.guilds.cache) {
+  for (const [, guild] of c.guilds.cache) {
     if (!isTrackedGuild(guild)) continue
     try {
       const invites = await guild.invites.fetch()
@@ -87,6 +152,30 @@ client.once(Events.ClientReady, async (c) => {
     } catch (err) {
       console.error(`Error fetching invites for guild ${guild.name}:`, err)
     }
+  }
+
+  // Set up leaderboard message if channel ID is provided
+  if (LEADERBOARD_CHANNEL_ID) {
+    try {
+      const channel = await c.channels.fetch(LEADERBOARD_CHANNEL_ID)
+      if (channel && channel.isTextBased()) {
+        leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
+        await updateLeaderboardMessage()
+        // Refresh leaderboard every 5 minutes
+        setInterval(updateLeaderboardMessage, 5 * 60 * 1000)
+        console.log('📊 Leaderboard message created and auto-update started.')
+      } else {
+        console.warn(
+          '⚠️ LEADERBOARD_CHANNEL_ID is set but channel is not text-based or not found.'
+        )
+      }
+    } catch (err) {
+      console.error('Error setting up leaderboard message:', err)
+    }
+  } else {
+    console.log(
+      'ℹ️ LEADERBOARD_CHANNEL_ID not set. Skipping Discord leaderboard message setup.'
+    )
   }
 })
 
@@ -147,6 +236,15 @@ client.on(Events.GuildMemberAdd, async (member) => {
       console.log(
         `🤝 Referral: ${user.tag} joined via invite ${usedInvite.code} from ${inviter.tag}`
       )
+
+      // Update in-memory referral scores
+      const prev = referralScores.get(inviter.id) || {
+        count: 0,
+        username: `${inviter.username}#${inviter.discriminator}`
+      }
+      prev.count += 1
+      prev.username = `${inviter.username}#${inviter.discriminator}`
+      referralScores.set(inviter.id, prev)
     } else {
       console.log(
         `🤝 Referral: ${user.tag} joined but no invite diff was detected`
@@ -262,6 +360,15 @@ client.on(Events.MessageCreate, async (message) => {
       is_scored: true,
       score_value: 1 // you can weight this in PostHog formulas
     })
+
+    // Update in-memory engagement scores
+    const prev = engagementScores.get(message.author.id) || {
+      score: 0,
+      username: `${message.author.username}#${message.author.discriminator}`
+    }
+    prev.score += 1
+    prev.username = `${message.author.username}#${message.author.discriminator}`
+    engagementScores.set(message.author.id, prev)
   }
 
   // C) Engagement with announcements (still logged separately)
