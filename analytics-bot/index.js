@@ -374,23 +374,45 @@ client.on(Events.MessageCreate, async (message) => {
   // A) Core activity: ANY message (for general analytics)
   trackDiscordEvent('discord_message_sent', message.author.id, baseProperties)
 
-  // B) Engagement-scored activity: only non-spammy, non-command messages
-  if (!looksSpammy) {
-    trackDiscordEvent('discord_message_scored', message.author.id, {
-      ...baseProperties,
-      is_scored: true,
-      score_value: 1
-    })
+// B) Engagement-scored activity: only non-spammy, non-command messages
+if (!looksSpammy) {
+  trackDiscordEvent('discord_message_scored', message.author.id, {
+    ...baseProperties,
+    is_scored: true,
+    score_value: 1
+  })
 
-    // Update in-memory engagement scores
-    const prev = engagementScores.get(message.author.id) || {
-      score: 0,
-      username: `${message.author.username}#${message.author.discriminator}`
-    }
-    prev.score += 1
-    prev.username = `${message.author.username}#${message.author.discriminator}`
-    engagementScores.set(message.author.id, prev)
+  // Update in-memory engagement scores
+  const prev = engagementScores.get(message.author.id) || {
+    score: 0,
+    username: `${message.author.username}#${message.author.discriminator}`
   }
+
+  prev.score += 1
+  prev.username = `${message.author.username}#${message.author.discriminator}`
+  engagementScores.set(message.author.id, prev)
+
+  // ✅ DEBUG: confirm scoring
+  console.log(
+    `✅ SCORED: ${message.author.tag} +1 (total ${prev.score}) in #${message.channel.name}`
+  )
+} else {
+  // ⛔ DEBUG: explain why it was not scored
+  console.log(
+    `⛔ NOT SCORED: ${message.author.tag} reason=${
+      isCommand
+        ? 'command'
+        : isShortMessage
+        ? 'too_short'
+        : isDuplicateMessage
+        ? 'duplicate'
+        : timeSinceLastMessageSec !== null && timeSinceLastMessageSec < 10
+        ? 'too_fast'
+        : 'unknown'
+    }`
+  )
+}
+
 
   // C) Engagement with announcements (still logged separately)
   if (message.channel.name === 'announcements') {
