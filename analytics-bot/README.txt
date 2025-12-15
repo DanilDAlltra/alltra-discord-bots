@@ -112,6 +112,47 @@ Issue a formal warning that gets logged to PostHog for analytics.
 - Replies with confirmation in Discord
 - Enables tracking of moderation patterns and user behavior
 
+## 🏆 Leaderboards & Scoring System
+
+### Automatic Engagement Scoring
+The bot automatically tracks and scores user engagement based on message quality:
+
+**Scoring Rules:**
+- ✅ **+1 point** for non-spammy messages (10+ characters, not duplicates, not commands)
+- ❌ **0 points** for spammy messages (short, duplicate, or rapid-fire messages)
+
+**Anti-Spam Filters:**
+- Messages shorter than 10 characters
+- Duplicate messages sent in sequence
+- Messages sent within 10 seconds of the previous one
+- Bot commands (starting with `/` or `!`)
+
+### Live Leaderboards
+The bot maintains two real-time leaderboards in a designated channel:
+
+#### 🏅 **Engagement Leaderboard**
+- Top 10 users by engagement points
+- Shows total points earned from quality messages
+- Updated automatically as users participate
+
+#### 🔗 **Referral Leaderboard**
+- Top 10 users by successful invites
+- Tracks members who joined via their invite links
+- Shows total successful referrals
+
+### Weekly Rewards
+- **$50 AUD in ALL Coin** for the top Engagement Champion each week
+- **$50 AUD in ALL Coin** for the top Referral Champion each week
+
+### Configuration
+To enable leaderboards, add these to your `.env` file:
+```env
+LEADERBOARD_CHANNEL_ID=your_channel_id_here
+LEADERBOARD_MESSAGE_ID=your_message_id_here  # Optional: reuse existing message
+```
+
+The bot will automatically create and maintain the leaderboard message in the specified channel.
+
 ## 📋 Prerequisites
 
 Before setting up the bot, ensure you have:
