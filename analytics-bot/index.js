@@ -8,7 +8,8 @@ const {
   POSTHOG_API_KEY,
   POSTHOG_HOST,
   GUILD_ID,
-  LEADERBOARD_CHANNEL_ID // 👈 new: channel where the leaderboard message lives
+  LEADERBOARD_CHANNEL_ID, // 👈 channel where the leaderboard message lives
+  LEADERBOARD_MESSAGE_ID // 👈 message ID to reuse (so we edit, not repost)
 } = process.env
 
 if (!DISCORD_TOKEN) {
@@ -154,16 +155,36 @@ client.once(Events.ClientReady, async (c) => {
     }
   }
 
-  // Set up leaderboard message if channel ID is provided
+  // ✅ Set up leaderboard message (reuse existing message if possible)
   if (LEADERBOARD_CHANNEL_ID) {
     try {
       const channel = await c.channels.fetch(LEADERBOARD_CHANNEL_ID)
       if (channel && channel.isTextBased()) {
-        leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
+        const existingMessageId = LEADERBOARD_MESSAGE_ID
+
+        if (existingMessageId) {
+          try {
+            leaderboardMessage = await channel.messages.fetch(existingMessageId)
+            console.log('📊 Reusing existing leaderboard message.')
+          } catch (e) {
+            console.warn(
+              '⚠️ LEADERBOARD_MESSAGE_ID was set but message could not be fetched. Creating a new one...'
+            )
+            leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
+            console.log(
+              `👉 Save this in .env as LEADERBOARD_MESSAGE_ID=${leaderboardMessage.id}`
+            )
+          }
+        } else {
+          leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
+          console.log(
+            `👉 Save this in .env as LEADERBOARD_MESSAGE_ID=${leaderboardMessage.id}`
+          )
+        }
+
         await updateLeaderboardMessage()
         setInterval(updateLeaderboardMessage, 5 * 60 * 1000)
-        console.log('📊 Leaderboard message created and auto-update started.')
-
+        console.log('📊 Leaderboard auto-update started.')
       } else {
         console.warn(
           '⚠️ LEADERBOARD_CHANNEL_ID is set but channel is not text-based or not found.'
@@ -358,7 +379,7 @@ client.on(Events.MessageCreate, async (message) => {
     trackDiscordEvent('discord_message_scored', message.author.id, {
       ...baseProperties,
       is_scored: true,
-      score_value: 1 // you can weight this in PostHog formulas
+      score_value: 1
     })
 
     // Update in-memory engagement scores
@@ -443,7 +464,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     message_id: reaction.message.id
   }
 
-  // Generic reaction event
   trackDiscordEvent('discord_reaction_added', user.id, props)
 
   console.log(
@@ -453,12 +473,9 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
 // 🛡️ E. MOD / SAFETY SIGNALS
 
-// 1) Message deleted (we treat as "deleted_by_mod" proxy)
 client.on(Events.MessageDelete, async (message) => {
   if (!message.guild) return
   if (!isTrackedGuild(message.guild)) return
-
-  // Ignore if the original author was a bot
   if (message.author?.bot) return
 
   trackDiscordEvent(
@@ -481,11 +498,9 @@ client.on(Events.MessageDelete, async (message) => {
   )
 })
 
-// 2) User banned (mod action)
 client.on(Events.GuildBanAdd, (ban) => {
   const guild = ban.guild
   const user = ban.user
-
   if (!isTrackedGuild(guild)) return
 
   trackDiscordEvent('discord_user_banned', user.id, {
@@ -512,7 +527,6 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   const key = makeVoiceKey(guild.id, user.id)
 
-  // CASE 1: Joined a voice channel (was in none, now in one)
   if (!oldChannel && newChannel) {
     const joinedAt = new Date()
 
@@ -537,16 +551,12 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     return
   }
 
-  // CASE 2: Left voice completely (was in one, now in none)
   if (oldChannel && !newChannel) {
     const session = voiceSessions.get(key)
     const leftAt = new Date()
 
     const joinedAt = session?.joinedAt || new Date(leftAt.getTime())
-    const sessionSeconds = Math.max(
-      0,
-      Math.round((leftAt - joinedAt) / 1000)
-    )
+    const sessionSeconds = Math.max(0, Math.round((leftAt - joinedAt) / 1000))
 
     trackDiscordEvent('discord_voice_left', user.id, {
       user_id: user.id,
@@ -568,17 +578,12 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     return
   }
 
-  // CASE 3: Switched channels (old & new are different)
   if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
     const now = new Date()
     const session = voiceSessions.get(key)
     const joinedAt = session?.joinedAt || now
-    const sessionSeconds = Math.max(
-      0,
-      Math.round((now - joinedAt) / 1000)
-    )
+    const sessionSeconds = Math.max(0, Math.round((now - joinedAt) / 1000))
 
-    // Close old session
     trackDiscordEvent('discord_voice_left', user.id, {
       user_id: user.id,
       username: `${user.username}#${user.discriminator}`,
@@ -591,7 +596,6 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
       session_seconds: sessionSeconds
     })
 
-    // Start new session
     voiceSessions.set(key, {
       channelId: newChannel.id,
       joinedAt: now
@@ -613,13 +617,21 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   }
 })
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('Shutting down…')
-  posthog.shutdown()
-  client.destroy()
-  process.exit(0)
-})
+// ----- PM2-safe graceful shutdown -----
+const gracefulShutdown = async (signal) => {
+  console.log(`🛑 Received ${signal}. Shutting down gracefully...`)
+  try {
+    await posthog.shutdown()
+    await client.destroy()
+  } catch (err) {
+    console.error('Error during shutdown:', err)
+  }
+}
+
+// PM2 controls lifecycle — do NOT force exit
+process.on('SIGTERM', gracefulShutdown)
+process.on('SIGINT', () => {}) // ignore SIGINT under PM2
+
 
 // Login
 client.login(DISCORD_TOKEN)
