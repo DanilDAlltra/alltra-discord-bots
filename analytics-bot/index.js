@@ -1,5 +1,11 @@
 import 'dotenv/config'
-import { Client, GatewayIntentBits, Partials, Events } from 'discord.js'
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Events,
+  PermissionsBitField
+} from 'discord.js'
 import { PostHog } from 'posthog-node'
 
 // ----- Config from .env -----
@@ -8,8 +14,12 @@ const {
   POSTHOG_API_KEY,
   POSTHOG_HOST,
   GUILD_ID,
-  LEADERBOARD_CHANNEL_ID, // channel where the leaderboard message lives
-  LEADERBOARD_MESSAGE_ID // message ID to reuse (so we edit, not repost)
+  LEADERBOARD_CHANNEL_ID,
+  LEADERBOARD_MESSAGE_ID,
+
+  // Optional exclusions
+  EXCLUDED_ROLE_IDS, // comma-separated role IDs to exclude from scoring
+  EXCLUDED_USER_IDS // comma-separated user IDs to exclude from scoring
 } = process.env
 
 if (!DISCORD_TOKEN) {
@@ -27,11 +37,15 @@ const posthog = new PostHog(POSTHOG_API_KEY, {
 })
 
 function trackDiscordEvent(eventName, distinctId, properties = {}) {
-  posthog.capture({
-    distinctId: distinctId?.toString() || 'unknown',
-    event: eventName,
-    properties
-  })
+  try {
+    posthog.capture({
+      distinctId: distinctId?.toString() || 'unknown',
+      event: eventName,
+      properties
+    })
+  } catch (err) {
+    console.error('PostHog capture error:', err)
+  }
 }
 
 // ----- Discord client -----
@@ -40,15 +54,15 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // 🔥 required for message.content (and in many cases MessageCreate debugging)
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildVoiceStates
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 })
 
-// Simple helper to check if we should track for this guild
+// Helper: check if we should track for this guild
 function isTrackedGuild(guild) {
   if (!GUILD_ID) return true
   return guild && guild.id === GUILD_ID
@@ -69,8 +83,8 @@ const guildInvites = new Map()
 const userMessageState = new Map()
 
 // In-memory engagement + referral scores for Discord leaderboard
-const engagementScores = new Map() // key=userId => { score, username }
-const referralScores = new Map() // key=userId => { count, username }
+const engagementScores = new Map() // userId -> { score, username }
+const referralScores = new Map() // userId -> { count, username }
 
 // Leaderboard message reference
 let leaderboardMessage = null
@@ -78,7 +92,53 @@ let leaderboardMessage = null
 // Prefix for basic mod commands like !warn
 const MOD_COMMAND_PREFIX = '!'
 
-// ----- Helper: Build leaderboard text -----
+// ----- Exclusion config -----
+const excludedRoleIds = (EXCLUDED_ROLE_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+const excludedUserIds = new Set(
+  (EXCLUDED_USER_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+)
+
+// Hard rule: never score staff/mod/admin/bots/explicit exclusions
+function isExcludedFromScoring(member) {
+  if (!member) return false
+
+  // Never score bots
+  if (member.user?.bot) return true
+
+  // Never score explicit user IDs
+  if (excludedUserIds.has(member.id)) return true
+
+  // Never score staff/mod permissions
+  const perms = member.permissions
+  if (
+    perms?.has(PermissionsBitField.Flags.Administrator) ||
+    perms?.has(PermissionsBitField.Flags.ModerateMembers) ||
+    perms?.has(PermissionsBitField.Flags.ManageGuild) ||
+    perms?.has(PermissionsBitField.Flags.ManageMessages) ||
+    perms?.has(PermissionsBitField.Flags.KickMembers) ||
+    perms?.has(PermissionsBitField.Flags.BanMembers)
+  ) {
+    return true
+  }
+
+  // Never score excluded roles (if provided)
+  if (excludedRoleIds.length > 0) {
+    for (const roleId of excludedRoleIds) {
+      if (member.roles?.cache?.has(roleId)) return true
+    }
+  }
+
+  return false
+}
+
+// ----- Leaderboard text -----
 function buildLeaderboardText() {
   let text = ''
   text += '🏆 **Alltraverse Weekly Leaderboards**\n'
@@ -122,12 +182,10 @@ function buildLeaderboardText() {
   return text
 }
 
-// ----- Helper: Update leaderboard message -----
 async function updateLeaderboardMessage() {
   if (!leaderboardMessage) return
-  const content = buildLeaderboardText()
   try {
-    await leaderboardMessage.edit(content)
+    await leaderboardMessage.edit(buildLeaderboardText())
   } catch (err) {
     console.error('Error updating leaderboard message:', err)
   }
@@ -153,7 +211,7 @@ client.once(Events.ClientReady, async (c) => {
     }
   }
 
-  // ✅ Set up leaderboard message (reuse existing message if possible)
+  // Leaderboard message setup
   if (LEADERBOARD_CHANNEL_ID) {
     try {
       const channel = await c.channels.fetch(LEADERBOARD_CHANNEL_ID)
@@ -166,7 +224,7 @@ client.once(Events.ClientReady, async (c) => {
             console.log('📊 Reusing existing leaderboard message.')
           } catch (e) {
             console.warn(
-              '⚠️ LEADERBOARD_MESSAGE_ID set but message could not be fetched. Creating a new one...'
+              '⚠️ LEADERBOARD_MESSAGE_ID set but message not found. Creating a new one...'
             )
             leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
             console.log(
@@ -185,16 +243,14 @@ client.once(Events.ClientReady, async (c) => {
         console.log('📊 Leaderboard auto-update started (every 5 minutes).')
       } else {
         console.warn(
-          '⚠️ LEADERBOARD_CHANNEL_ID is set but channel is not text-based or not found.'
+          '⚠️ LEADERBOARD_CHANNEL_ID set but channel not found / not text-based.'
         )
       }
     } catch (err) {
       console.error('Error setting up leaderboard message:', err)
     }
   } else {
-    console.log(
-      'ℹ️ LEADERBOARD_CHANNEL_ID not set. Skipping Discord leaderboard message setup.'
-    )
+    console.log('ℹ️ LEADERBOARD_CHANNEL_ID not set. Skipping leaderboard setup.')
   }
 })
 
@@ -221,14 +277,13 @@ client.on(Events.GuildMemberAdd, async (member) => {
     const newInvites = await guild.invites.fetch()
 
     let usedInvite = null
-
     newInvites.forEach((inv) => {
       const oldUses = previousInvites.get(inv.code) ?? 0
       const newUses = inv.uses ?? 0
       if (newUses > oldUses) usedInvite = inv
     })
 
-    // Update cache with latest counts
+    // Update cache
     const updatedMap = new Map()
     newInvites.forEach((inv) => updatedMap.set(inv.code, inv.uses ?? 0))
     guildInvites.set(guild.id, updatedMap)
@@ -251,18 +306,25 @@ client.on(Events.GuildMemberAdd, async (member) => {
         `🤝 Referral: ${user.tag} joined via invite ${usedInvite.code} from ${inviter.tag}`
       )
 
-      // Update in-memory referral scores
-      const prev = referralScores.get(inviter.id) || {
-        count: 0,
-        username: `${inviter.username}#${inviter.discriminator}`
+      // ✅ Only count referral score if inviter is NOT excluded
+      const inviterMember = await guild.members.fetch(inviter.id).catch(() => null)
+      const inviterExcluded = isExcludedFromScoring(inviterMember)
+
+      if (!inviterExcluded) {
+        const prev = referralScores.get(inviter.id) || {
+          count: 0,
+          username: `${inviter.username}#${inviter.discriminator}`
+        }
+        prev.count += 1
+        prev.username = `${inviter.username}#${inviter.discriminator}`
+        referralScores.set(inviter.id, prev)
+      } else {
+        console.log(
+          `⛔ Referral NOT COUNTED: inviter ${inviter.tag} excluded_staff_or_bot`
+        )
       }
-      prev.count += 1
-      prev.username = `${inviter.username}#${inviter.discriminator}`
-      referralScores.set(inviter.id, prev)
     } else {
-      console.log(
-        `🤝 Referral: ${user.tag} joined but no invite diff was detected`
-      )
+      console.log(`🤝 Referral: ${user.tag} joined but no invite diff detected`)
     }
   } catch (err) {
     console.error('Error handling referral on member join:', err)
@@ -291,7 +353,9 @@ client.on(Events.InviteCreate, (invite) => {
   }
 
   console.log(
-    `🔗 Invite created in ${guild.name}: https://discord.gg/${invite.code} (by ${invite.inviter?.tag || 'unknown'})`
+    `🔗 Invite created in ${guild.name}: https://discord.gg/${invite.code} (by ${
+      invite.inviter?.tag || 'unknown'
+    })`
   )
 })
 
@@ -311,16 +375,22 @@ client.on(Events.GuildMemberRemove, (member) => {
 
 // 3) Message sent (core + scored engagement)
 client.on(Events.MessageCreate, async (message) => {
-  // 🔥 Always log receipt FIRST (this tells us instantly if bot sees messages)
-  console.log(
-    `📩 MessageCreate fired | author=${message.author?.tag} | guild=${message.guild?.id || 'DM'} | channel=${message.channel?.name}`
-  )
-
   try {
-    // Ignore bot messages (including this bot)
     if (message.author?.bot) return
     if (!message.guild) return
     if (!isTrackedGuild(message.guild)) return
+
+    // helpful debug line (you already like this)
+    console.log(
+      `📩 MessageCreate fired | author=${message.author.username} | guild=${message.guild.id} | channel=${message.channel?.name || message.channel?.id}`
+    )
+
+    // Ensure we have a member object (sometimes null)
+    const member =
+      message.member ||
+      (await message.guild.members.fetch(message.author.id).catch(() => null))
+
+    const excluded = isExcludedFromScoring(member)
 
     const isCommand =
       message.content.startsWith('/') ||
@@ -341,7 +411,6 @@ client.on(Events.MessageCreate, async (message) => {
 
     const isShortMessage = trimmedLength < 10
 
-    // update state
     userMessageState.set(message.author.id, {
       lastMessageAt: now,
       lastMessageContent: trimmedContent
@@ -364,14 +433,15 @@ client.on(Events.MessageCreate, async (message) => {
       time_since_last_message_sec: timeSinceLastMessageSec,
       is_duplicate_message: isDuplicateMessage,
       is_short_message: isShortMessage,
-      looks_spammy: looksSpammy
+      looks_spammy,
+      excluded_from_scoring: excluded
     }
 
-    // A) Core activity: ANY message
+    // A) Track every message to PostHog (for analytics)
     trackDiscordEvent('discord_message_sent', message.author.id, baseProperties)
 
-    // B) Engagement-scored activity
-    if (!looksSpammy) {
+    // B) Engagement scoring: only non-spammy AND not excluded
+    if (!looksSpammy && !excluded) {
       trackDiscordEvent('discord_message_scored', message.author.id, {
         ...baseProperties,
         is_scored: true,
@@ -390,23 +460,23 @@ client.on(Events.MessageCreate, async (message) => {
         `✅ SCORED: ${message.author.tag} +1 (total ${prev.score}) in #${message.channel.name}`
       )
     } else {
-      console.log(
-        `⛔ NOT SCORED: ${message.author.tag} reason=${
-          isCommand
-            ? 'command'
-            : isShortMessage
-            ? 'too_short'
-            : isDuplicateMessage
-            ? 'duplicate'
-            : timeSinceLastMessageSec !== null && timeSinceLastMessageSec < 10
-            ? 'too_fast'
-            : 'unknown'
-        }`
-      )
+      const reason = excluded
+        ? 'excluded_staff_or_bot'
+        : isCommand
+        ? 'command'
+        : isShortMessage
+        ? 'too_short'
+        : isDuplicateMessage
+        ? 'duplicate'
+        : timeSinceLastMessageSec !== null && timeSinceLastMessageSec < 10
+        ? 'too_fast'
+        : 'unknown'
+
+      console.log(`⛔ NOT SCORED: ${message.author.tag} reason=${reason}`)
     }
 
     // C) Engagement with announcements
-    if (message.channel?.name === 'announcements') {
+    if (message.channel.name === 'announcements') {
       trackDiscordEvent(
         'discord_message_in_announcements',
         message.author.id,
@@ -414,10 +484,10 @@ client.on(Events.MessageCreate, async (message) => {
       )
     }
 
-    // D) Mod / safety – basic "!warn" command
+    // D) Mod / safety – basic "!warn"
     if (
       message.content.startsWith(`${MOD_COMMAND_PREFIX}warn`) &&
-      message.member?.permissions.has('ModerateMembers')
+      member?.permissions?.has(PermissionsBitField.Flags.ModerateMembers)
     ) {
       const mentionedUser = message.mentions.users.first()
       const [, , ...reasonParts] = message.content.split(' ')
@@ -449,7 +519,7 @@ client.on(Events.MessageCreate, async (message) => {
       )
     }
   } catch (err) {
-    console.error('❌ Error inside MessageCreate handler:', err)
+    console.error('MessageCreate handler error:', err)
   }
 })
 
@@ -485,27 +555,37 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
 // 🛡️ Message deleted
 client.on(Events.MessageDelete, async (message) => {
-  if (!message.guild) return
-  if (!isTrackedGuild(message.guild)) return
-  if (message.author?.bot) return
+  try {
+    if (!message.guild) return
+    if (!isTrackedGuild(message.guild)) return
+    if (message.author?.bot) return
 
-  trackDiscordEvent('discord_message_deleted_by_mod', message.author?.id, {
-    user_id: message.author?.id || 'unknown',
-    username: message.author
-      ? `${message.author.username}#${message.author.discriminator}`
-      : 'unknown',
-    channel_id: message.channel.id,
-    channel_name: message.channel.name,
-    message_id: message.id,
-    deleted_at: new Date().toISOString()
-  })
+    trackDiscordEvent(
+      'discord_message_deleted_by_mod',
+      message.author?.id || 'unknown',
+      {
+        user_id: message.author?.id || 'unknown',
+        username: message.author
+          ? `${message.author.username}#${message.author.discriminator}`
+          : 'unknown',
+        channel_id: message.channel.id,
+        channel_name: message.channel.name,
+        message_id: message.id,
+        deleted_at: new Date().toISOString()
+      }
+    )
 
-  console.log(
-    `🗑️ Message deleted in #${message.channel.name} (author: ${message.author?.tag || 'unknown'})`
-  )
+    console.log(
+      `🗑️ Message deleted in #${message.channel.name} (author: ${
+        message.author?.tag || 'unknown'
+      })`
+    )
+  } catch (err) {
+    console.error('MessageDelete handler error:', err)
+  }
 })
 
-// 🚫 User banned
+// 🚫 Ban
 client.on(Events.GuildBanAdd, (ban) => {
   const guild = ban.guild
   const user = ban.user
@@ -522,7 +602,7 @@ client.on(Events.GuildBanAdd, (ban) => {
   console.log(`🚫 User banned: ${user.tag} in ${guild.name}`)
 })
 
-// 🎧 Voice activity tracking
+// 🎧 Voice tracking
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   const guild = newState.guild || oldState.guild
   if (!guild || !isTrackedGuild(guild)) return
@@ -534,7 +614,6 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   const newChannel = newState.channel
   const key = makeVoiceKey(guild.id, user.id)
 
-  // Joined
   if (!oldChannel && newChannel) {
     const joinedAt = new Date()
     voiceSessions.set(key, { channelId: newChannel.id, joinedAt })
@@ -549,15 +628,14 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
       joined_at: joinedAt.toISOString()
     })
 
-    console.log(`🎧 ${user.tag} joined voice: #${newChannel.name}`)
+    console.log(`🎧 ${user.tag} joined voice: #${newChannel.name} in ${guild.name}`)
     return
   }
 
-  // Left completely
   if (oldChannel && !newChannel) {
     const session = voiceSessions.get(key)
     const leftAt = new Date()
-    const joinedAt = session?.joinedAt || leftAt
+    const joinedAt = session?.joinedAt || new Date(leftAt.getTime())
     const sessionSeconds = Math.max(0, Math.round((leftAt - joinedAt) / 1000))
 
     trackDiscordEvent('discord_voice_left', user.id, {
@@ -573,11 +651,10 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     })
 
     voiceSessions.delete(key)
-    console.log(`🎧 ${user.tag} left voice: #${oldChannel.name} (${sessionSeconds}s)`)
+    console.log(`🎧 ${user.tag} left voice: #${oldChannel.name} after ${sessionSeconds}s`)
     return
   }
 
-  // Switched
   if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
     const now = new Date()
     const session = voiceSessions.get(key)
@@ -609,7 +686,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     })
 
     console.log(
-      `🎧 ${user.tag} switched voice: #${oldChannel.name} → #${newChannel.name} (${sessionSeconds}s)`
+      `🎧 ${user.tag} switched voice: #${oldChannel.name} → #${newChannel.name} (${sessionSeconds}s in old channel)`
     )
   }
 })
@@ -625,6 +702,7 @@ const gracefulShutdown = async (signal) => {
   }
 }
 
+// PM2 lifecycle — do not force exit
 process.on('SIGTERM', gracefulShutdown)
 process.on('SIGINT', () => {}) // ignore SIGINT under PM2
 
