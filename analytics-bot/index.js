@@ -161,9 +161,9 @@ client.once(Events.ClientReady, async (c) => {
       if (channel && channel.isTextBased()) {
         leaderboardMessage = await channel.send('🏆 Loading leaderboards...')
         await updateLeaderboardMessage()
-        // Refresh leaderboard every 5 minutes
         setInterval(updateLeaderboardMessage, 5 * 60 * 1000)
         console.log('📊 Leaderboard message created and auto-update started.')
+
       } else {
         console.warn(
           '⚠️ LEADERBOARD_CHANNEL_ID is set but channel is not text-based or not found.'
